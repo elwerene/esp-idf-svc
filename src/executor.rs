@@ -1,72 +1,121 @@
-#[cfg(all(feature = "isr-async-executor", feature = "alloc"))]
 pub mod asyncs {
-    use core::ptr;
-    use core::sync::atomic::{AtomicPtr, Ordering};
+    #[cfg(all(
+        feature = "isr-async-executor",
+        feature = "alloc",
+        feature = "heapless"
+    ))]
+    pub mod isr {
+        use core::sync::atomic::{AtomicPtr, Ordering};
+        use core::{mem, ptr};
 
-    extern crate alloc;
-    use alloc::sync::Arc;
+        extern crate alloc;
+        use alloc::sync::{Arc, Weak};
 
-    use embedded_svc::utils::asyncs::executor::*;
+        use embedded_svc::utils::asyncs::executor::isr::*;
 
-    use esp_idf_hal::interrupt;
-    use esp_idf_hal::mutex::Condvar;
+        use esp_idf_hal::interrupt;
 
-    pub type EspLocalExecutor<'a> = LocalExecutor<'a, CurrentTaskWait, SharedTaskHandle>;
-    pub type EspSendableExecutor<'a> =
-        SendableExecutor<'a, CurrentTaskWait, SharedTaskHandle, Condvar>;
+        pub type EspLocalExecutor<'a, const C: usize> =
+            ISRExecutor<'a, C, TaskHandle, CurrentTaskWait, Local>;
+        pub type EspExecutor<'a, const C: usize> =
+            ISRExecutor<'a, C, TaskHandle, CurrentTaskWait, Sendable>;
 
-    pub struct CurrentTaskWait;
+        pub struct CurrentTaskWait;
 
-    impl Wait for CurrentTaskWait {
-        fn wait(&self) {
-            interrupt::task::wait_any_notification();
-        }
-    }
-
-    pub struct SharedTaskHandle(Arc<AtomicPtr<esp_idf_sys::tskTaskControlBlock>>);
-
-    impl SharedTaskHandle {
-        fn new() -> Self {
-            Self(Arc::new(AtomicPtr::new(ptr::null_mut())))
-        }
-    }
-
-    impl Notify for SharedTaskHandle {
-        fn prerun(&self) {
-            self.0
-                .store(interrupt::task::current().unwrap(), Ordering::SeqCst);
+        impl Wait for CurrentTaskWait {
+            fn wait(&self) {
+                interrupt::task::wait_any_notification();
+            }
         }
 
-        fn notify(&self) {
-            let freertos_task = self.0.load(Ordering::SeqCst);
+        pub struct TaskHandle(Arc<AtomicPtr<esp_idf_sys::tskTaskControlBlock>>);
 
-            if !freertos_task.is_null() {
-                unsafe {
-                    interrupt::task::notify(freertos_task, 1);
+        impl TaskHandle {
+            fn new() -> Self {
+                Self(Arc::new(AtomicPtr::new(ptr::null_mut())))
+            }
+        }
+
+        impl Drop for TaskHandle {
+            fn drop(&mut self) {
+                let mut arc = mem::replace(&mut self.0, Arc::new(AtomicPtr::new(ptr::null_mut())));
+
+                // Busy loop until we can destroy the Arc - which means that nobody is actively holding a strong reference to it
+                // and thus trying to notify our FreeRtos task, which will likely be destroyed afterwards
+                loop {
+                    arc = match Arc::try_unwrap(arc) {
+                        Ok(_) => break,
+                        Err(a) => a,
+                    }
                 }
             }
         }
 
-        fn postrun(&self) {
-            self.0.store(ptr::null_mut(), Ordering::SeqCst);
+        impl NotifyFactory for TaskHandle {
+            type Notify = SharedTaskHandle;
+
+            fn notifier(&self) -> Self::Notify {
+                SharedTaskHandle(Arc::downgrade(&self.0))
+            }
         }
-    }
 
-    impl Clone for SharedTaskHandle {
-        fn clone(&self) -> Self {
-            Self(self.0.clone())
+        impl RunContextFactory for TaskHandle {
+            fn prerun(&self) {
+                let current_task = interrupt::task::current().unwrap();
+                let stored_task = self.0.load(Ordering::SeqCst);
+
+                if stored_task.is_null() {
+                    self.0.store(current_task, Ordering::SeqCst);
+                } else if stored_task != current_task {
+                    panic!("Cannot call prerun() twice from two diffeent threads");
+                }
+            }
         }
-    }
 
-    pub fn local<'a>(max_tasks: usize) -> EspLocalExecutor<'a> {
-        let task_handle = SharedTaskHandle::new();
+        pub struct SharedTaskHandle(Weak<AtomicPtr<esp_idf_sys::tskTaskControlBlock>>);
 
-        LocalExecutor::new(max_tasks, CurrentTaskWait, task_handle)
-    }
+        impl Notify for SharedTaskHandle {
+            fn notify(&self) {
+                if let Some(notify) = self.0.upgrade() {
+                    let freertos_task = notify.load(Ordering::SeqCst);
 
-    pub fn sendable<'a>(max_tasks: usize) -> EspSendableExecutor<'a> {
-        let task_handle = SharedTaskHandle::new();
+                    if !freertos_task.is_null() {
+                        unsafe {
+                            interrupt::task::notify(freertos_task, 1);
+                        }
+                    }
+                }
+            }
+        }
 
-        SendableExecutor::new(max_tasks, CurrentTaskWait, task_handle)
+        pub fn local<'a, const C: usize>() -> EspLocalExecutor<'a, C> {
+            ISRExecutor::<C, _, _, Local>::new(TaskHandle::new(), CurrentTaskWait)
+        }
+
+        pub fn executor<'a, const C: usize>() -> EspExecutor<'a, C> {
+            ISRExecutor::<C, _, _, Sendable>::new(TaskHandle::new(), CurrentTaskWait)
+        }
+
+        pub fn local_tasks_spawner<'a, const C: usize, T>(
+        ) -> embedded_svc::utils::asyncs::executor::spawn::TasksSpawner<
+            'a,
+            C,
+            EspLocalExecutor<'a, C>,
+            T,
+        > {
+            embedded_svc::utils::asyncs::executor::spawn::TasksSpawner::<'a, C, _, T>::new(local::<
+                'a,
+                C,
+            >(
+            ))
+        }
+
+        pub fn tasks_spawner<'a, const C: usize, T>(
+        ) -> embedded_svc::utils::asyncs::executor::spawn::TasksSpawner<'a, C, EspExecutor<'a, C>, T>
+        {
+            embedded_svc::utils::asyncs::executor::spawn::TasksSpawner::<'a, C, _, T>::new(
+                executor::<'a, C>(),
+            )
+        }
     }
 }
