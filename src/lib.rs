@@ -3,7 +3,7 @@
 #![feature(const_btree_new)]
 #![feature(generic_associated_types)] // For mutex, http, http::client, http::server, ota
 #![cfg_attr(version("1.61"), allow(deprecated_where_clause_location))]
-
+#![allow(unused_imports)]
 #[cfg(any(feature = "alloc"))]
 #[macro_use]
 extern crate alloc;
@@ -48,7 +48,7 @@ pub mod log;
     esp_idf_comp_esp_event_enabled
 ))]
 pub mod mqtt;
-#[cfg(esp_idf_config_lwip_ipv4_napt)]
+#[cfg(esp_idf_lwip_ipv4_napt)]
 pub mod napt;
 #[cfg(all(feature = "alloc", esp_idf_comp_esp_netif_enabled))]
 pub mod netif;
