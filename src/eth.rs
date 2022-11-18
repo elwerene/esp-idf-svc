@@ -966,7 +966,7 @@ impl<P> Eth for EspEth<P> {
     fn get_status(&self) -> Status {
         let status = self.waitable.get(|shared| shared.status.clone());
 
-        info!("Providing status: {:?}", status);
+        //info!("Providing status: {:?}", status);
 
         status
     }
